@@ -21,17 +21,19 @@ use gleam_core::{
     Error, Result,
 };
 use itertools::Itertools;
-use lsp::request::GotoDefinition;
 use lsp_types::{
     self as lsp,
     notification::{DidChangeTextDocument, DidCloseTextDocument, DidSaveTextDocument},
-    request::{Completion, Formatting, HoverRequest},
+    request::{Completion, Formatting, GotoDefinition, HoverRequest},
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidSaveTextDocumentParams, Hover,
     HoverContents, HoverProviderCapability, InitializeParams, MarkedString, Position,
     PublishDiagnosticsParams, Range, TextEdit, Url,
 };
 
 use crate::{cli, fs::ProjectIO};
+
+const COMPILING_PROGRESS_TOKEN: &str = "compiling-gleam";
+const CREATE_COMPILING_PROGRESS_TOKEN: &str = "create-compiling-progress-token";
 
 pub fn main() -> Result<()> {
     tracing::info!("language_server_starting");
@@ -99,6 +101,7 @@ pub fn main() -> Result<()> {
         serde_json::from_value(connection.initialize(server_capabilities_json).unwrap()).unwrap();
 
     // Run the server and wait for the two threads to end (typically by trigger LSP Exit event).
+    tracing::info!("about to start");
     LanguageServer::new(initialization_params)?.run(connection)?;
     io_threads.join().expect("joining_lsp_threads");
 
@@ -147,6 +150,9 @@ pub struct LanguageServer {
     /// In the event the the project config changes this will need to be
     /// discarded and reloaded to handle any changes to dependencies.
     compiler: LspProjectCompiler<ProjectIO>,
+
+    // The next free id number to use for a request
+    request_id: i32,
 }
 
 impl LanguageServer {
@@ -161,7 +167,49 @@ impl LanguageServer {
             published_diagnostics: HashSet::new(),
             project_root,
             compiler,
+            request_id: 0,
         })
+    }
+
+    pub fn run(&mut self, connection: lsp_server::Connection) -> Result<()> {
+        self.create_compilation_progress_token(&connection);
+        self.start_watching_gleam_toml(&connection);
+
+        // Compile the project once so we have all the state and any initial errors
+        self.compile(&connection)?;
+        self.publish_stored_diagnostics(&connection);
+
+        // Enter the message loop, handling each message that comes in from the client
+        for message in &connection.receiver {
+            tracing::info!("in: {:?}", message);
+            match message {
+                lsp_server::Message::Request(request) => {
+                    if connection.handle_shutdown(&request).expect("LSP shutdown") {
+                        return Ok(());
+                    }
+                    let id = request.id.clone();
+                    let result = self.handle_request(request);
+                    let (response, diagnostic) = result_to_response(result, id);
+                    if let Some(diagnostic) = diagnostic {
+                        self.process_gleam_diagnostic(diagnostic);
+                        self.publish_stored_diagnostics(&connection);
+                    }
+                    connection
+                        .sender
+                        .send(lsp_server::Message::Response(response))
+                        .unwrap();
+                }
+
+                lsp_server::Message::Response(response) => {
+                    self.handle_response(&connection, response);
+                }
+
+                lsp_server::Message::Notification(notification) => {
+                    self.handle_notification(&connection, notification).unwrap();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Publish all stored diagnostics to the client.
@@ -268,41 +316,10 @@ impl LanguageServer {
         Ok(())
     }
 
-    pub fn run(&mut self, connection: lsp_server::Connection) -> Result<()> {
-        self.start_watching_gleam_toml(&connection);
-
-        // Compile the project once so we have all the state and any initial errors
-        self.compile()?;
-        self.publish_stored_diagnostics(&connection);
-
-        // Enter the message loop, handling each message that comes in from the client
-        for message in &connection.receiver {
-            match message {
-                lsp_server::Message::Request(request) => {
-                    if connection.handle_shutdown(&request).expect("LSP shutdown") {
-                        return Ok(());
-                    }
-                    let id = request.id.clone();
-                    let result = self.handle_request(request);
-                    let (response, diagnostic) = result_to_response(result, id);
-                    if let Some(diagnostic) = diagnostic {
-                        self.process_gleam_diagnostic(diagnostic);
-                        self.publish_stored_diagnostics(&connection);
-                    }
-                    connection
-                        .sender
-                        .send(lsp_server::Message::Response(response))
-                        .unwrap();
-                }
-
-                lsp_server::Message::Response(_) => (),
-
-                lsp_server::Message::Notification(notification) => {
-                    self.handle_notification(&connection, notification).unwrap();
-                }
-            }
-        }
-        Ok(())
+    fn next_request_id(&mut self) -> i32 {
+        let id = self.request_id;
+        self.request_id += 1;
+        id
     }
 
     fn start_watching_gleam_toml(&mut self, connection: &lsp_server::Connection) {
@@ -336,7 +353,7 @@ impl LanguageServer {
             ),
         };
         let request = lsp_server::Request {
-            id: 1.into(),
+            id: self.next_request_id().into(),
             method: "client/registerCapability".into(),
             params: serde_json::value::to_value(lsp::RegistrationParams {
                 registrations: vec![watch_config],
@@ -349,8 +366,10 @@ impl LanguageServer {
             .unwrap();
     }
 
-    fn compile(&mut self) -> Result<(), Error> {
+    fn compile(&mut self, connection: &lsp_server::Connection) -> Result<(), Error> {
+        self.notify_client_of_compilation_start(connection);
         let result = self.compiler.compile();
+        self.notify_client_of_compilation_end(connection);
         self.store_result_diagnostics(result)?;
         Ok(())
     }
@@ -385,6 +404,30 @@ impl LanguageServer {
         Ok(())
     }
 
+    fn handle_response(
+        &mut self,
+        _connection: &lsp_server::Connection,
+        _response: lsp_server::Response,
+    ) {
+        ()
+        // // If we receive a response to our request to create the progress token
+        // // used to indicate that we are compiling Gleam send an "end" for this
+        // // progress token.
+        // // We know that not compilation is happening now (as we're handling a
+        // // response and the LSP dispatching is single threaded) so we want to
+        // // ensure that any progress is ended. It would be possible for progress
+        // // to be started by not finished if we sent the start and the end before
+        // // the client sent this response back saying that we're allowed to use
+        // // the token. We're naughty, we don't wait to hear if we can use it
+        // // before we do.
+        // let create_token: lsp_server::RequestId =
+        //     CREATE_COMPILING_PROGRESS_TOKEN.to_string().into();
+        // if response.id == CREATE_COMPILING_PROGRESS_TOKEN.to_string().into() {
+        //     tracing::info!("ending progress");
+        // self.notify_client_of_compilation_end(connection);
+        // }
+    }
+
     fn handle_notification(
         &mut self,
         connection: &lsp_server::Connection,
@@ -393,7 +436,7 @@ impl LanguageServer {
         match notification.method.as_str() {
             "textDocument/didSave" => {
                 let params = cast_notification::<DidSaveTextDocument>(notification).unwrap();
-                let result = self.text_document_did_save(params);
+                let result = self.text_document_did_save(params, connection);
                 self.publish_result_diagnostics(result, connection)
             }
 
@@ -418,11 +461,15 @@ impl LanguageServer {
         }
     }
 
-    fn text_document_did_save(&mut self, params: DidSaveTextDocumentParams) -> Result<()> {
+    fn text_document_did_save(
+        &mut self,
+        params: DidSaveTextDocumentParams,
+        connection: &lsp_server::Connection,
+    ) -> Result<()> {
         // The file is in sync with the file system, discard our cache of the changes
         let _ = self.edited.remove(params.text_document.uri.path());
         // The files on disc have changed, so compile the project with the new changes
-        self.compile()?;
+        self.compile(connection)?;
         Ok(())
     }
 
@@ -644,6 +691,61 @@ impl LanguageServer {
 
         Ok(vec![text_edit_replace(new_text)])
     }
+
+    fn create_compilation_progress_token(&mut self, connection: &lsp_server::Connection) {
+        let params = lsp::WorkDoneProgressCreateParams {
+            token: lsp::NumberOrString::String(COMPILING_PROGRESS_TOKEN.into()),
+        };
+        let request = lsp_server::Request {
+            id: CREATE_COMPILING_PROGRESS_TOKEN.to_string().into(),
+            method: "window/workDoneProgress/create".into(),
+            params: serde_json::to_value(&params).expect("WorkDoneProgressCreateParams json"),
+        };
+        connection
+            .sender
+            .send(lsp_server::Message::Request(request))
+            .expect("WorkDoneProgressCreate");
+        tracing::info!("done");
+    }
+
+    fn notify_client_of_compilation_start(&self, connection: &lsp_server::Connection) {
+        self.send_work_done_notification(
+            connection,
+            lsp::WorkDoneProgress::Begin(lsp::WorkDoneProgressBegin {
+                title: "Compiling Gleam".into(),
+                cancellable: Some(false),
+                message: None,
+                percentage: None,
+            }),
+        );
+    }
+
+    fn notify_client_of_compilation_end(&self, connection: &lsp_server::Connection) {
+        self.send_work_done_notification(
+            connection,
+            lsp::WorkDoneProgress::End(lsp::WorkDoneProgressEnd { message: None }),
+        );
+    }
+
+    fn send_work_done_notification(
+        &self,
+        connection: &lsp_server::Connection,
+        work_done: lsp::WorkDoneProgress,
+    ) {
+        tracing::info!("sending {:?}", work_done);
+        let params = lsp::ProgressParams {
+            token: lsp::NumberOrString::String(COMPILING_PROGRESS_TOKEN.to_string()),
+            value: lsp::ProgressParamsValue::WorkDone(work_done),
+        };
+        let notification = lsp_server::Notification {
+            method: "$/progress".into(),
+            params: serde_json::to_value(&params).expect("ProgressParams json"),
+        };
+        connection
+            .sender
+            .send(lsp_server::Message::Notification(notification))
+            .expect("send_work_done_notification send")
+    }
 }
 
 fn uri_to_module_name(uri: &Url, root: &Path) -> Option<String> {
@@ -847,7 +949,7 @@ where
 {
     pub fn new(io: IO) -> Result<Self> {
         // TODO: different telemetry that doesn't write to stdout
-        let telemetry = Box::new(cli::Reporter::new());
+        let telemetry = Box::new(cli::NullReporter);
         let manifest = crate::dependencies::download(None)?;
         let config = crate::config::root_config()?;
 

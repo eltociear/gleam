@@ -13,6 +13,23 @@ use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 use crate::print_warning;
 
 #[derive(Debug, Default, Clone)]
+pub struct NullReporter;
+
+impl Telemetry for NullReporter {
+    fn compiling_package(&self, _name: &str) {
+        ()
+    }
+
+    fn checking_package(&self, _name: &str) {
+        ()
+    }
+
+    fn warning(&self, _warning: &Warning) {
+        ()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct Reporter;
 
 impl Reporter {
@@ -59,59 +76,59 @@ pub fn ask_password(question: &str) -> Result<String, Error> {
 }
 
 pub fn print_publishing(name: &str, version: &Version) {
-    print_colourful_prefix(" Publishing", &format!("{} v{}", name, version))
+    // print_colourful_prefix(" Publishing", &format!("{} v{}", name, version))
 }
 
 pub fn print_published(duration: Duration) {
-    print_colourful_prefix("  Published", &format!("in {}", seconds(duration)))
+    // print_colourful_prefix("  Published", &format!("in {}", seconds(duration)))
 }
 
 pub fn print_retired(package: &str, version: &str) {
-    print_colourful_prefix("    Retired", &format!("{} {}", package, version))
+    // print_colourful_prefix("    Retired", &format!("{} {}", package, version))
 }
 
 pub fn print_unretired(package: &str, version: &str) {
-    print_colourful_prefix("  Unretired", &format!("{} {}", package, version))
+    // print_colourful_prefix("  Unretired", &format!("{} {}", package, version))
 }
 
 pub fn print_publishing_documentation() {
-    print_colourful_prefix(" Publishing", "documentation");
+    // print_colourful_prefix(" Publishing", "documentation");
 }
 
 pub fn print_downloading(text: &str) {
-    print_colourful_prefix("Downloading", text)
+    // print_colourful_prefix("Downloading", text)
 }
 
 pub fn print_resolving_versions() {
-    print_colourful_prefix("  Resolving", "versions")
+    // print_colourful_prefix("  Resolving", "versions")
 }
 
 pub fn print_compiling(text: &str) {
-    print_colourful_prefix("  Compiling", text)
+    // print_colourful_prefix("  Compiling", text)
 }
 
 pub fn print_checking(text: &str) {
-    print_colourful_prefix("   Checking", text)
+    // print_colourful_prefix("   Checking", text)
 }
 
 pub fn print_compiled(duration: Duration) {
-    print_colourful_prefix("   Compiled", &format!("in {}", seconds(duration)))
+    // print_colourful_prefix("   Compiled", &format!("in {}", seconds(duration)))
 }
 
 pub fn print_checked(duration: Duration) {
-    print_colourful_prefix("    Checked", &format!("in {}", seconds(duration)))
+    // print_colourful_prefix("    Checked", &format!("in {}", seconds(duration)))
 }
 
 pub fn print_running(text: &str) {
-    print_colourful_prefix("    Running", text)
+    // print_colourful_prefix("    Running", text)
 }
 
 pub fn print_added(text: &str) {
-    print_colourful_prefix("      Added", text)
+    // print_colourful_prefix("      Added", text)
 }
 
 pub fn print_generating_documentation() {
-    print_colourful_prefix(" Generating", "documentation")
+    // print_colourful_prefix(" Generating", "documentation")
 }
 
 pub fn print_packages_downloaded(start: Instant, count: usize) {
